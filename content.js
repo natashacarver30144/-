@@ -410,6 +410,7 @@ async function runCollection() {
   pushLog("Старт сбора", "info");
 
   let profileSelection = chooseWorkingProfile(currentSettings);
+  const profileSelection = chooseWorkingProfile(currentSettings);
   let container = profileSelection?.container || null;
 
   if (profileSelection) {
@@ -434,6 +435,10 @@ async function runCollection() {
       flushAllData();
       return;
     }
+    pushLog("Контейнер скролла не найден даже после fallback/auto-detect", "error");
+    isRunning = false;
+    flushAllData();
+    return;
   }
 
   let lastScrollTop = container.scrollTop;
