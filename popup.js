@@ -442,7 +442,7 @@ $('resetSettingsBtn')?.addEventListener('click', () => {
 // === Picker селекторов ===
 $('pickScrollSelectorBtn')?.addEventListener('click', () => {
   sendToActiveTab({ type: 'START_SELECTOR_PICKER', callbackType: 'scroll' });
-  showToast('Кликните на контейнер скролла на странице', 'info');
+  showToast('Выделите мышкой область скролла на странице', 'info');
 });
 
 $('pickLinkSelectorBtn')?.addEventListener('click', () => {

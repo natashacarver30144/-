@@ -47,6 +47,8 @@ let stats = {
 let isPickingSelector = false;
 let pickerCallbackType = null;
 let pickerOverlay = null;
+let pickerSelectionBox = null;
+let pickerDragStart = null;
 
 // Throttle для логов - не чаще 1 раза в 2 секунды
 let lastLogTime = 0;
@@ -356,6 +358,17 @@ function chooseWorkingProfile(settings) {
   if (winner && winner.container && winner.score >= 5) {
     return winner;
   }
+
+  // Если контейнер найден, но ссылок пока мало/нет (частый кейс до прогрузки вкладки),
+  // всё равно используем лучший контейнер вместо полного фейла.
+  const containerOnlyWinner = evaluations.find((item) => item?.container);
+  if (containerOnlyWinner) {
+    return {
+      ...containerOnlyWinner,
+      confidence: Math.max(15, Number(containerOnlyWinner.confidence || 0))
+    };
+  }
+
   const heuristic = detectHeuristicProfile();
   if (heuristic) {
     return {
@@ -396,6 +409,7 @@ async function runCollection() {
   updateChatTitle();
   pushLog("Старт сбора", "info");
 
+  let profileSelection = chooseWorkingProfile(currentSettings);
   const profileSelection = chooseWorkingProfile(currentSettings);
   let container = profileSelection?.container || null;
 
@@ -405,6 +419,22 @@ async function runCollection() {
   }
 
   if (!container) {
+    pushLog('Контейнер не найден, пробуем открыть вкладку "Ссылки" и повторить', 'warn');
+    await clickLinksTab();
+    await wait(900);
+    profileSelection = chooseWorkingProfile(currentSettings);
+    container = profileSelection?.container || null;
+    if (profileSelection) {
+      applyProfileSelection(profileSelection);
+      pushLog(`Профиль селекторов после retry: ${activeSelectorProfile} (confidence ${selectorConfidence}%)`, 'info');
+    }
+
+    if (!container) {
+      pushLog("Контейнер скролла не найден даже после fallback/auto-detect", "error");
+      isRunning = false;
+      flushAllData();
+      return;
+    }
     pushLog("Контейнер скролла не найден даже после fallback/auto-detect", "error");
     isRunning = false;
     flushAllData();
@@ -515,17 +545,35 @@ function startSelectorPicker(callbackType) {
     height: 100%;
     pointer-events: none;
     z-index: 999999;
-    background: rgba(0, 255, 0, 0.1);
+    background: rgba(0, 255, 0, 0.08);
     display: none;
   `;
   document.body.appendChild(pickerOverlay);
 
-  // Добавляем обработчик hover
-  document.addEventListener('mouseover', pickerHoverHandler, true);
-  document.addEventListener('mouseout', pickerOutHandler, true);
-  document.addEventListener('click', pickerClickHandler, true);
+  pickerSelectionBox = document.createElement('div');
+  pickerSelectionBox.style.cssText = `
+    position: fixed;
+    border: 2px dashed #22c55e;
+    background: rgba(34, 197, 94, 0.15);
+    pointer-events: none;
+    z-index: 1000000;
+    display: none;
+  `;
+  document.body.appendChild(pickerSelectionBox);
 
-  pushLog(`Picker запущен для: ${callbackType}`, "info");
+  // Для scroll selector используем выделение области мышью,
+  // для link selector сохраняем прежний точечный click-picker.
+  if (callbackType === 'scroll') {
+    document.addEventListener('mousedown', pickerMouseDownHandler, true);
+    document.addEventListener('mousemove', pickerMouseMoveHandler, true);
+    document.addEventListener('mouseup', pickerMouseUpHandler, true);
+    pushLog('Выделите мышкой область скролла (зажмите и отпустите)', 'info');
+  } else {
+    document.addEventListener('mouseover', pickerHoverHandler, true);
+    document.addEventListener('mouseout', pickerOutHandler, true);
+    document.addEventListener('click', pickerClickHandler, true);
+    pushLog(`Picker запущен для: ${callbackType}`, "info");
+  }
 }
 
 function stopSelectorPicker() {
@@ -536,15 +584,115 @@ function stopSelectorPicker() {
     pickerOverlay.remove();
     pickerOverlay = null;
   }
+  if (pickerSelectionBox) {
+    pickerSelectionBox.remove();
+    pickerSelectionBox = null;
+  }
+  pickerDragStart = null;
 
   document.removeEventListener('mouseover', pickerHoverHandler, true);
   document.removeEventListener('mouseout', pickerOutHandler, true);
   document.removeEventListener('click', pickerClickHandler, true);
+  document.removeEventListener('mousedown', pickerMouseDownHandler, true);
+  document.removeEventListener('mousemove', pickerMouseMoveHandler, true);
+  document.removeEventListener('mouseup', pickerMouseUpHandler, true);
 
   document.querySelectorAll('[data-picker-highlight]').forEach(el => {
     el.style.outline = '';
     el.removeAttribute('data-picker-highlight');
   });
+}
+
+
+function isScrollableElement(el) {
+  if (!el || !(el instanceof Element)) return false;
+  const style = window.getComputedStyle(el);
+  const overflowY = style.overflowY;
+  const canScroll = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+  return canScroll || el.scrollHeight > el.clientHeight + 20;
+}
+
+function findBestScrollableFromRect(rect) {
+  if (!rect) return null;
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  let node = document.elementFromPoint(cx, cy);
+  while (node) {
+    if (isScrollableElement(node)) return node;
+    node = node.parentElement;
+  }
+
+  const candidates = Array.from(document.querySelectorAll('div, section, main, aside, article'));
+  let best = null;
+  let bestScore = -1;
+  candidates.forEach((el) => {
+    if (!isScrollableElement(el)) return;
+    const r = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.right, r.right) - Math.max(rect.left, r.left));
+    const y = Math.max(0, Math.min(rect.bottom, r.bottom) - Math.max(rect.top, r.top));
+    const overlap = x * y;
+    if (overlap > bestScore) {
+      bestScore = overlap;
+      best = el;
+    }
+  });
+  return best;
+}
+
+function pickerMouseDownHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll') return;
+  e.preventDefault();
+  e.stopPropagation();
+  pickerDragStart = { x: e.clientX, y: e.clientY };
+  if (pickerSelectionBox) {
+    pickerSelectionBox.style.display = 'block';
+    pickerSelectionBox.style.left = `${e.clientX}px`;
+    pickerSelectionBox.style.top = `${e.clientY}px`;
+    pickerSelectionBox.style.width = '0px';
+    pickerSelectionBox.style.height = '0px';
+  }
+}
+
+function pickerMouseMoveHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart || !pickerSelectionBox) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const left = Math.min(pickerDragStart.x, e.clientX);
+  const top = Math.min(pickerDragStart.y, e.clientY);
+  const width = Math.abs(e.clientX - pickerDragStart.x);
+  const height = Math.abs(e.clientY - pickerDragStart.y);
+  pickerSelectionBox.style.left = `${left}px`;
+  pickerSelectionBox.style.top = `${top}px`;
+  pickerSelectionBox.style.width = `${width}px`;
+  pickerSelectionBox.style.height = `${height}px`;
+}
+
+function pickerMouseUpHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const left = Math.min(pickerDragStart.x, e.clientX);
+  const top = Math.min(pickerDragStart.y, e.clientY);
+  const width = Math.max(4, Math.abs(e.clientX - pickerDragStart.x));
+  const height = Math.max(4, Math.abs(e.clientY - pickerDragStart.y));
+  const rect = { left, top, right: left + width, bottom: top + height, width, height };
+
+  const bestScrollable = findBestScrollableFromRect(rect);
+  const selector = generateSelector(bestScrollable || document.elementFromPoint(e.clientX, e.clientY));
+
+  if (selector) {
+    chrome.runtime.sendMessage({
+      type: 'SELECTOR_PICKED',
+      selector,
+      callbackType: pickerCallbackType
+    });
+    pushLog(`Выбран scroll-селектор по области: ${selector}`, 'success');
+  } else {
+    pushLog('Не удалось определить скролл-область', 'error');
+  }
+
+  stopSelectorPicker();
 }
 
 function pickerHoverHandler(e) {
@@ -718,4 +866,3 @@ chrome.runtime.onMessage.addListener((message) => {
     });
   }
 });
-
