@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "TG Web Link Collector",
+  "version": "2.0.0",
+  "description": "Collect links from Telegram Web by CSS selectors with auto-scroll, pause/resume, sync backup.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "notifications",
+    "scripting"
+  ],
+  "host_permissions": ["https://web.telegram.org/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "TG Link Collector",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://web.telegram.org/*"],
+      "js": ["shared.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "start-collection": {
+      "suggested_key": {
+        "default": "Alt+S"
+      },
+      "description": "Начать сбор ссылок"
+    },
+    "stop-collection": {
+      "suggested_key": {
+        "default": "Alt+X"
+      },
+      "description": "Остановить сбор"
+    },
+    "pause-collection": {
+      "suggested_key": {
+        "default": "Alt+P"
+      },
+      "description": "Пауза/Возобновление сбора"
+    }
+  }
+}
+

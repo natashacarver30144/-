@@ -1,0 +1,11 @@
+{
+  "scrollSelector": "div.Profile.custom-scroll.Transition_slide.Transition_slide-active.with-notch",
+  "linkSelectors": [
+    "a.site-name.word-break-all",
+    "a.site-name"
+  ],
+  "scrollStep": 300,
+  "scrollDelay": 800,
+  "inactivityTimeout": 60000,
+  "maxSteps": 25
+}
