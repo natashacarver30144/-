@@ -10,6 +10,8 @@ const state = {
   logs: [],
   settings: { ...(window.DEFAULT_SETTINGS || {}) },
   chatTitle: '',
+  selectorProfileName: 'manual',
+  selectorConfidence: 0,
   isRunning: false,
   isPaused: false
 };
@@ -30,6 +32,7 @@ const inactivityTimeoutEl = $('inactivityTimeout');
 const maxStepsEl = $('maxSteps');
 const retryAttemptsEl = $('retryAttempts');
 const retryDelayEl = $('retryDelay');
+const selectorHealthEl = $('selectorHealth');
 
 // Кнопки
 const startBtn = $('startBtn');
@@ -113,6 +116,16 @@ function updateStatus() {
   }
 }
 
+function renderSelectorHealth() {
+  if (!selectorHealthEl) return;
+  const profile = state.selectorProfileName || 'manual';
+  const confidence = Math.max(0, Math.min(100, Number(state.selectorConfidence) || 0));
+  selectorHealthEl.textContent = `Профиль: ${profile} · confidence: ${confidence}%`;
+  selectorHealthEl.className = 'selector-health';
+  if (confidence >= 70) selectorHealthEl.classList.add('good');
+  else if (confidence >= 40) selectorHealthEl.classList.add('warn');
+}
+
 function renderList(container, items, options = {}) {
   container.innerHTML = '';
   const { reverse = false, limit = null, isLog = false } = options;
@@ -163,7 +176,7 @@ function readSettingsFromUi() {
     .map((line) => line.trim())
     .filter(Boolean);
   
-  return {
+  return (window.sanitizeSettings || ((v) => v))({
     scrollSelector: scrollSelectorEl?.value?.trim() || '',
     linkSelectors,
     scrollStep: Number(scrollStepEl?.value) || defaults.scrollStep,
@@ -172,25 +185,25 @@ function readSettingsFromUi() {
     maxSteps: Number(maxStepsEl?.value) || defaults.maxSteps,
     retryAttempts: Number(retryAttemptsEl?.value) || defaults.retryAttempts,
     retryDelay: Number(retryDelayEl?.value) || defaults.retryDelay
-  };
+  });
 }
 
 // === Storage ===
 function persistSettings(settings) {
-  const settingsJson = JSON.stringify(settings, null, 2);
-  chrome.storage.local.set({ settings, settingsJson }, () => {
-    const defaults = window.DEFAULT_SETTINGS || {};
-    state.settings = { ...defaults, ...settings };
+  const normalizedSettings = (window.sanitizeSettings || ((v) => v))(settings);
+  const settingsJson = JSON.stringify(normalizedSettings, null, 2);
+  chrome.storage.local.set({ settings: normalizedSettings, settingsJson }, () => {
+    state.settings = normalizedSettings;
     renderSettings();
     
     // Резервное копирование в sync storage
-    chrome.runtime.sendMessage({ type: 'BACKUP_SETTINGS', settings }).catch(() => {});
+    chrome.runtime.sendMessage({ type: 'BACKUP_SETTINGS', settings: normalizedSettings }).catch(() => {});
   });
 }
 
 function loadState() {
   chrome.storage.local.get(
-    ['links', 'numbers', 'duplicates', 'duplicateMap', 'duplicateUniqueCount', 'logs', 'settings', 'settingsJson', 'chatTitle'],
+    ['links', 'numbers', 'duplicates', 'duplicateMap', 'duplicateUniqueCount', 'logs', 'settings', 'settingsJson', 'chatTitle', 'selectorProfileName', 'selectorConfidence'],
     (res) => {
       const defaults = window.DEFAULT_SETTINGS || {};
       state.links = res.links || [];
@@ -200,13 +213,15 @@ function loadState() {
       state.duplicates = res.duplicates || [];
       state.logs = res.logs || [];
       state.chatTitle = res.chatTitle || '';
+      state.selectorProfileName = res.selectorProfileName || 'manual';
+      state.selectorConfidence = Number(res.selectorConfidence) || 0;
       
       const fromJson = res.settingsJson ? safeParseJson(res.settingsJson) : null;
-      state.settings = {
+      state.settings = (window.sanitizeSettings || ((v) => v))({
         ...defaults,
         ...(res.settings || {}),
         ...(fromJson || {})
-      };
+      });
 
       updateStats();
       updateStatus();
@@ -215,6 +230,7 @@ function loadState() {
       renderList(duplicatesListEl, getDuplicateDisplayList(state.duplicateMap, state.duplicates), { limit: 200 });
       renderList(logsListEl, state.logs, { limit: 100, isLog: true });
       renderSettings();
+      renderSelectorHealth();
     }
   );
 }
@@ -363,7 +379,7 @@ $('exportLogsBtn')?.addEventListener('click', () => {
 $('clearBtn')?.addEventListener('click', () => {
   if (!confirm('Удалить все собранные данные?')) return;
   
-  chrome.storage.local.remove(['links', 'numbers', 'duplicates', 'duplicateMap', 'duplicateUniqueCount', 'logs', 'chatTitle'], () => {
+  chrome.storage.local.remove(['links', 'numbers', 'duplicates', 'duplicateMap', 'duplicateUniqueCount', 'logs', 'chatTitle', 'selectorProfileName', 'selectorConfidence'], () => {
     state.links = [];
     state.numbers = [];
     state.duplicates = [];
@@ -371,11 +387,14 @@ $('clearBtn')?.addEventListener('click', () => {
     state.duplicateUniqueCount = 0;
     state.logs = [];
     state.chatTitle = '';
+    state.selectorProfileName = 'manual';
+    state.selectorConfidence = 0;
     updateStats();
     renderList(linksListEl, state.links);
     renderList(numbersListEl, state.numbers);
     renderList(duplicatesListEl, []);
     renderList(logsListEl, state.logs);
+    renderSelectorHealth();
     showToast('Данные очищены', 'success');
   });
 });
@@ -423,7 +442,7 @@ $('resetSettingsBtn')?.addEventListener('click', () => {
 // === Picker селекторов ===
 $('pickScrollSelectorBtn')?.addEventListener('click', () => {
   sendToActiveTab({ type: 'START_SELECTOR_PICKER', callbackType: 'scroll' });
-  showToast('Кликните на контейнер скролла на странице', 'info');
+  showToast('Выделите мышкой область скролла на странице', 'info');
 });
 
 $('pickLinkSelectorBtn')?.addEventListener('click', () => {
@@ -580,7 +599,7 @@ chrome.runtime.onMessage.addListener((message) => {
     
     // Загружаем только данные, не обновляем статус кнопок
     chrome.storage.local.get(
-      ['links', 'numbers', 'duplicates', 'duplicateMap', 'duplicateUniqueCount', 'logs', 'settings', 'settingsJson', 'chatTitle'],
+      ['links', 'numbers', 'duplicates', 'duplicateMap', 'duplicateUniqueCount', 'logs', 'settings', 'settingsJson', 'chatTitle', 'selectorProfileName', 'selectorConfidence'],
       (res) => {
         const defaults = window.DEFAULT_SETTINGS || {};
         state.links = res.links || [];
@@ -590,13 +609,15 @@ chrome.runtime.onMessage.addListener((message) => {
         state.duplicates = res.duplicates || [];
         state.logs = res.logs || [];
         state.chatTitle = res.chatTitle || '';
+        state.selectorProfileName = res.selectorProfileName || 'manual';
+        state.selectorConfidence = Number(res.selectorConfidence) || 0;
 
         const fromJson = res.settingsJson ? safeParseJson(res.settingsJson) : null;
-        state.settings = {
+        state.settings = (window.sanitizeSettings || ((v) => v))({
           ...defaults,
           ...(res.settings || {}),
           ...(fromJson || {})
-        };
+        });
 
         updateStats();
         // НЕ вызываем updateStatus() здесь, чтобы кнопки не менялись автоматически
@@ -605,6 +626,7 @@ chrome.runtime.onMessage.addListener((message) => {
         renderList(duplicatesListEl, getDuplicateDisplayList(state.duplicateMap, state.duplicates), { limit: 200 });
         renderList(logsListEl, state.logs, { limit: 100, isLog: true });
         renderSettings();
+        renderSelectorHealth();
       }
     );
   }
@@ -641,4 +663,3 @@ sendToActiveTab({ type: 'SYNC_CHAT_TITLE' });
 
 // Периодическое обновление статуса - раз в 5 секунд вместо 2
 setInterval(refreshStatus, 5000);
-
