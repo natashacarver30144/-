@@ -15,6 +15,53 @@ if (typeof window.SHARED_LOADED === 'undefined') {
     retryDelay: 1000
   };
 
+
+  window.DEFAULT_SELECTOR_PROFILES = [
+    {
+      id: 'primary',
+      name: 'Primary',
+      scrollSelectors: [
+        'div.Profile.custom-scroll.with-notch.Transition_slide.Transition_slide-active',
+        'div.flexscroll'
+      ],
+      linkSelectors: ['a.site-name.word-break-all', 'a.site-name']
+    },
+    {
+      id: 'fallback-chat',
+      name: 'Fallback: chat',
+      scrollSelectors: ['div.chat-list, div.messages-container, div[role="feed"]'],
+      linkSelectors: ['a[href*="t.me/"]', 'a[href*="telegram.me/"]', 'a[href^="https://t.me/"]']
+    }
+  ];
+
+  function toPositiveInt(value, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    const int = Math.trunc(num);
+    if (int < min || int > max) return fallback;
+    return int;
+  }
+
+  window.sanitizeSettings = function(rawSettings) {
+    const defaults = window.DEFAULT_SETTINGS || {};
+    const source = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+
+    const linkSelectors = Array.isArray(source.linkSelectors)
+      ? source.linkSelectors.map((item) => String(item || '').trim()).filter(Boolean)
+      : defaults.linkSelectors;
+
+    return {
+      scrollSelector: String(source.scrollSelector || defaults.scrollSelector || '').trim(),
+      linkSelectors: linkSelectors.length > 0 ? linkSelectors : (defaults.linkSelectors || []),
+      scrollStep: toPositiveInt(source.scrollStep, defaults.scrollStep, { min: 10, max: 10000 }),
+      scrollDelay: toPositiveInt(source.scrollDelay, defaults.scrollDelay, { min: 50, max: 60000 }),
+      inactivityTimeout: toPositiveInt(source.inactivityTimeout, defaults.inactivityTimeout, { min: 1000, max: 600000 }),
+      maxSteps: toPositiveInt(source.maxSteps, defaults.maxSteps, { min: 0, max: 100000 }),
+      retryAttempts: toPositiveInt(source.retryAttempts, defaults.retryAttempts, { min: 0, max: 20 }),
+      retryDelay: toPositiveInt(source.retryDelay, defaults.retryDelay, { min: 0, max: 30000 })
+    };
+  }
+
   window.CHAT_TITLE_SELECTOR = 'h3[dir="auto"][role="button"].fullName.AS54Cntu.vr53L_9p';
 
   // Нормализация ссылки (убираем разницу http/https, www)
@@ -284,6 +331,8 @@ if (typeof globalThis !== 'undefined') {
     extractPhoneFromPath: window.extractPhoneFromPath,
     safeParseJson: window.safeParseJson,
     wait: window.wait,
+    sanitizeSettings: window.sanitizeSettings,
+    DEFAULT_SELECTOR_PROFILES: window.DEFAULT_SELECTOR_PROFILES,
     generateSelector: window.generateSelector,
     generalizeSelector: window.generalizeSelector,
     matchesGeneralizedSelector: window.matchesGeneralizedSelector

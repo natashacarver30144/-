@@ -17,6 +17,11 @@ const extractPhoneFromPath = window.extractPhoneFromPath || (() => null);
 const safeParseJson = window.safeParseJson || (() => null);
 const wait = window.wait || ((ms) => new Promise(r => setTimeout(r, ms)));
 const generateSelector = window.generateSelector || ((el) => el?.tagName?.toLowerCase() || null);
+const sanitizeSettings = window.sanitizeSettings || ((settings) => settings);
+const DEFAULT_SELECTOR_PROFILES = window.DEFAULT_SELECTOR_PROFILES || [];
+
+let activeSelectorProfile = 'manual';
+let selectorConfidence = 0;
 
 let isRunning = false;
 let isPaused = false;
@@ -74,7 +79,9 @@ function saveAllData(notifyPopup = false) {
     numbers: Array.from(numberSet),
     duplicateMap,
     duplicateUniqueCount,
-    logs: logBuffer
+    logs: logBuffer,
+    selectorProfileName: activeSelectorProfile,
+    selectorConfidence
   };
   
   chrome.storage.local.set(data, () => {
@@ -105,7 +112,9 @@ function loadState() {
         "duplicateUniqueCount",
         "logs",
         "settings",
-        "settingsJson"
+        "settingsJson",
+        "selectorProfileName",
+        "selectorConfidence"
       ],
       (res) => {
       linkSet = new Set(res.links || []);
@@ -115,11 +124,13 @@ function loadState() {
         res.duplicateUniqueCount || Object.keys(duplicateMap).length;
       logBuffer = res.logs || [];
       const fromJson = res.settingsJson ? safeParseJson(res.settingsJson) : null;
-      currentSettings = {
+      currentSettings = sanitizeSettings({
         ...DEFAULT_SETTINGS,
         ...(res.settings || {}),
         ...(fromJson || {})
-      };
+      });
+      activeSelectorProfile = res.selectorProfileName || 'manual';
+      selectorConfidence = Number(res.selectorConfidence) || 0;
       resolve();
       }
     );
@@ -238,6 +249,140 @@ function collectLinks() {
 
 // Функции normalizeLink, safeParseJson, extractPhoneFromPath, wait уже определены в shared.js
 
+
+function queryAllSafe(selector, root = document) {
+  if (!selector) return [];
+  try {
+    return Array.from(root.querySelectorAll(selector));
+  } catch {
+    return [];
+  }
+}
+
+function queryOneSafe(selector, root = document) {
+  return queryAllSafe(selector, root)[0] || null;
+}
+
+function collectValidLinkCount(selectors, root = document) {
+  if (!Array.isArray(selectors)) return 0;
+  let valid = 0;
+  selectors.forEach((selector) => {
+    const direct = queryAllSafe(selector, root);
+    const generalized = window.generalizeSelector ? window.generalizeSelector(selector) : selector;
+    const nodes = direct.length > 0 ? direct : (generalized !== selector ? queryAllSafe(generalized, root) : []);
+    nodes.forEach((el) => {
+      const href = el.getAttribute('href') || el.href || '';
+      const text = el.textContent?.trim() || '';
+      if (normalizeLink(href) || normalizeLink(text)) valid += 1;
+    });
+  });
+  return valid;
+}
+
+function buildSelectorProfiles(settings) {
+  const primary = {
+    id: 'user-settings',
+    name: 'User settings',
+    scrollSelectors: [settings.scrollSelector].filter(Boolean),
+    linkSelectors: settings.linkSelectors || []
+  };
+  const defaults = (DEFAULT_SELECTOR_PROFILES || []).map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    scrollSelectors: Array.isArray(profile.scrollSelectors) ? profile.scrollSelectors : [],
+    linkSelectors: Array.isArray(profile.linkSelectors) ? profile.linkSelectors : []
+  }));
+  return [primary, ...defaults];
+}
+
+function resolveScrollContainer(scrollSelectors) {
+  for (const selector of (scrollSelectors || [])) {
+    const found = queryOneSafe(selector);
+    if (found) return { container: found, selector, generalized: false };
+    const generalized = window.generalizeSelector ? window.generalizeSelector(selector) : selector;
+    if (generalized && generalized !== selector) {
+      const genFound = queryOneSafe(generalized);
+      if (genFound) return { container: genFound, selector: generalized, generalized: true };
+    }
+  }
+  return { container: null, selector: null, generalized: false };
+}
+
+function evaluateProfile(profile) {
+  const scroll = resolveScrollContainer(profile.scrollSelectors);
+  if (!scroll.container) return { profile, score: 0, confidence: 0, container: null };
+  const validLinks = collectValidLinkCount(profile.linkSelectors, document);
+  const score = validLinks * 5 + (scroll.generalized ? 1 : 3);
+  const confidence = Math.min(100, Math.max(20, validLinks * 8 + (scroll.generalized ? 5 : 15)));
+  return { profile, score, confidence, container: scroll.container, scrollSelector: scroll.selector };
+}
+
+function detectHeuristicProfile() {
+  const candidates = queryAllSafe('div, section, main').filter((el) => {
+    const style = window.getComputedStyle(el);
+    const scrollable = ['auto', 'scroll'].includes(style.overflowY) || el.scrollHeight > el.clientHeight * 1.2;
+    return scrollable && el.clientHeight > 180;
+  }).slice(0, 120);
+
+  let best = null;
+  candidates.forEach((container, idx) => {
+    const linkSelectors = ['a[href*="t.me/"]', 'a[href*="telegram.me/"]', 'a[href^="https://t.me/"]'];
+    const validLinks = collectValidLinkCount(linkSelectors, container);
+    const score = validLinks * 6 + Math.min(10, Math.floor(container.clientHeight / 120));
+    if (!best || score > best.score) {
+      best = {
+        score,
+        validLinks,
+        container,
+        profile: {
+          id: `auto-${idx + 1}`,
+          name: 'Auto-detected',
+          scrollSelectors: [],
+          linkSelectors
+        },
+        confidence: Math.min(95, 35 + validLinks * 10)
+      };
+    }
+  });
+
+  if (!best || best.score < 12) return null;
+  return best;
+}
+
+function chooseWorkingProfile(settings) {
+  const profiles = buildSelectorProfiles(settings);
+  const evaluations = profiles.map(evaluateProfile).sort((a, b) => b.score - a.score);
+  const winner = evaluations[0];
+  if (winner && winner.container && winner.score >= 5) {
+    return winner;
+  }
+  const heuristic = detectHeuristicProfile();
+  if (heuristic) {
+    return {
+      profile: heuristic.profile,
+      score: heuristic.score,
+      confidence: heuristic.confidence,
+      container: heuristic.container,
+      scrollSelector: null
+    };
+  }
+  return null;
+}
+
+function applyProfileSelection(selection) {
+  if (!selection) return;
+  const profile = selection.profile || {};
+  if (Array.isArray(profile.linkSelectors) && profile.linkSelectors.length > 0) {
+    currentSettings.linkSelectors = profile.linkSelectors;
+  }
+  if (selection.scrollSelector) {
+    currentSettings.scrollSelector = selection.scrollSelector;
+  }
+  activeSelectorProfile = profile.name || profile.id || 'manual';
+  selectorConfidence = Number(selection.confidence || 0);
+  chrome.storage.local.set({ selectorProfileName: activeSelectorProfile, selectorConfidence });
+}
+
 async function runCollection() {
   if (isRunning) {
     pushLog("Сбор уже запущен", "warn");
@@ -251,36 +396,18 @@ async function runCollection() {
   updateChatTitle();
   pushLog("Старт сбора", "info");
 
-  // Пробуем найти контейнер скролла
-  let container = null;
-  const scrollSel = currentSettings.scrollSelector;
-  
-  // Пробуем прямой селектор
-  try {
-    container = document.querySelector(scrollSel);
-  } catch (e) {}
-  
-  // Если не найден, пробуем обобщённый селектор
-  if (!container && scrollSel) {
-    const generalized = window.generalizeSelector(scrollSel);
-    if (generalized !== scrollSel) {
-      try {
-        container = document.querySelector(generalized);
-        if (container) {
-          pushLog("Использован обобщённый селектор: " + generalized, "info");
-        }
-      } catch (e) {}
-    }
-  }
-      
-  if (!container) {
-    pushLog("Контейнер скролла не найден", "error");
-    isRunning = false;
+  const profileSelection = chooseWorkingProfile(currentSettings);
+  let container = profileSelection?.container || null;
 
-    // Перезагружаем страницу и кликаем на вкладку "Ссылки"
-    chrome.storage.local.set({ shouldClickLinksTab: true }, () => {
-      location.reload();
-    });
+  if (profileSelection) {
+    applyProfileSelection(profileSelection);
+    pushLog(`Профиль селекторов: ${activeSelectorProfile} (confidence ${selectorConfidence}%)`, 'info');
+  }
+
+  if (!container) {
+    pushLog("Контейнер скролла не найден даже после fallback/auto-detect", "error");
+    isRunning = false;
+    flushAllData();
     return;
   }
 
@@ -296,12 +423,13 @@ async function runCollection() {
     if (stopRequested) break;
 
     stats.steps += 1;
-    collectLinks();
+    const before = collectLinks();
 
     container.scrollBy(0, currentSettings.scrollStep);
     await wait(currentSettings.scrollDelay);
 
-    collectLinks();
+    const after = collectLinks();
+    const gained = (before?.newCount || 0) + (after?.newCount || 0);
 
     const heightChanged = container.scrollHeight !== lastHeight;
     const scrollMoved = container.scrollTop !== lastScrollTop;
@@ -316,6 +444,16 @@ async function runCollection() {
         if (heightChanged) changes.push('высота');
         if (scrollMoved) changes.push('скролл');
         pushLog(`Активность: ${changes.join(', ')}`, 'info');
+      }
+    }
+
+    if (!heightChanged && !scrollMoved && gained === 0 && stats.steps > 5 && stats.steps % 8 === 0) {
+      const fallbackSelection = chooseWorkingProfile(currentSettings);
+      if (fallbackSelection?.container) {
+        applyProfileSelection(fallbackSelection);
+        container = fallbackSelection.container;
+        pushLog(`Auto-recover: переключение на профиль ${activeSelectorProfile}`, 'warn');
+        lastActivityTs = Date.now();
       }
     }
 
