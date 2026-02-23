@@ -50,6 +50,7 @@ let pickerOverlay = null;
 let pickerSelectionBox = null;
 let pickerDragStart = null;
 let pickerDidDrag = false;
+let activePointerId = null;
 
 // Throttle для логов - не чаще 1 раза в 2 секунды
 let lastLogTime = 0;
@@ -563,6 +564,9 @@ function startSelectorPicker(callbackType) {
     document.addEventListener('mousedown', pickerMouseDownHandler, true);
     window.addEventListener('mousemove', pickerMouseMoveHandler, true);
     window.addEventListener('mouseup', pickerMouseUpHandler, true);
+    document.addEventListener('pointerdown', pickerPointerDownHandler, true);
+    window.addEventListener('pointermove', pickerPointerMoveHandler, true);
+    window.addEventListener('pointerup', pickerPointerUpHandler, true);
     if (pickerOverlay) {
       pickerOverlay.style.display = 'block';
       pickerOverlay.textContent = 'Выделите область скролла мышкой';
@@ -590,6 +594,7 @@ function stopSelectorPicker() {
   }
   pickerDragStart = null;
   pickerDidDrag = false;
+  activePointerId = null;
 
   document.removeEventListener('mouseover', pickerHoverHandler, true);
   document.removeEventListener('mouseout', pickerOutHandler, true);
@@ -597,6 +602,9 @@ function stopSelectorPicker() {
   document.removeEventListener('mousedown', pickerMouseDownHandler, true);
   window.removeEventListener('mousemove', pickerMouseMoveHandler, true);
   window.removeEventListener('mouseup', pickerMouseUpHandler, true);
+  document.removeEventListener('pointerdown', pickerPointerDownHandler, true);
+  window.removeEventListener('pointermove', pickerPointerMoveHandler, true);
+  window.removeEventListener('pointerup', pickerPointerUpHandler, true);
 
   document.querySelectorAll('[data-picker-highlight]').forEach(el => {
     el.style.outline = '';
@@ -641,6 +649,18 @@ function findBestScrollableFromRect(rect) {
 }
 
 
+
+function getEventPoint(event) {
+  if (event && typeof event.clientX === 'number' && typeof event.clientY === 'number') {
+    return { x: event.clientX, y: event.clientY };
+  }
+  const touch = event?.changedTouches?.[0] || event?.touches?.[0];
+  if (touch) {
+    return { x: touch.clientX, y: touch.clientY };
+  }
+  return null;
+}
+
 function findScrollableAncestorFromPoint(x, y) {
   let node = document.elementFromPoint(x, y);
   while (node) {
@@ -650,50 +670,24 @@ function findScrollableAncestorFromPoint(x, y) {
   return null;
 }
 
-function pickerMouseDownHandler(e) {
-  if (!isPickingSelector || pickerCallbackType !== 'scroll') return;
-  if (typeof e.button === 'number' && e.button !== 0) return;
-  e.preventDefault();
-  e.stopPropagation();
-  pickerDidDrag = false;
-  pickerDragStart = { x: e.clientX, y: e.clientY };
-  if (pickerSelectionBox) {
-    pickerSelectionBox.style.display = 'block';
-    pickerSelectionBox.style.left = `${e.clientX}px`;
-    pickerSelectionBox.style.top = `${e.clientY}px`;
-    pickerSelectionBox.style.width = '0px';
-    pickerSelectionBox.style.height = '0px';
+
+function finalizeScrollPickerByPoint(startPoint, endPoint) {
+  if (!startPoint || !endPoint) {
+    pushLog('Не удалось определить координаты выделения', 'error');
+    stopSelectorPicker();
+    return;
   }
-}
 
-function pickerMouseMoveHandler(e) {
-  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart || !pickerSelectionBox) return;
-  const dx = Math.abs(e.clientX - pickerDragStart.x);
-  const dy = Math.abs(e.clientY - pickerDragStart.y);
-  if (dx > 4 || dy > 4) pickerDidDrag = true;
-  const left = Math.min(pickerDragStart.x, e.clientX);
-  const top = Math.min(pickerDragStart.y, e.clientY);
-  const width = Math.abs(e.clientX - pickerDragStart.x);
-  const height = Math.abs(e.clientY - pickerDragStart.y);
-  pickerSelectionBox.style.left = `${left}px`;
-  pickerSelectionBox.style.top = `${top}px`;
-  pickerSelectionBox.style.width = `${width}px`;
-  pickerSelectionBox.style.height = `${height}px`;
-}
-
-function pickerMouseUpHandler(e) {
-  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart) return;
-
-  const left = Math.min(pickerDragStart.x, e.clientX);
-  const top = Math.min(pickerDragStart.y, e.clientY);
-  const width = Math.max(4, Math.abs(e.clientX - pickerDragStart.x));
-  const height = Math.max(4, Math.abs(e.clientY - pickerDragStart.y));
+  const left = Math.min(startPoint.x, endPoint.x);
+  const top = Math.min(startPoint.y, endPoint.y);
+  const width = Math.max(4, Math.abs(endPoint.x - startPoint.x));
+  const height = Math.max(4, Math.abs(endPoint.y - startPoint.y));
   const rect = { left, top, right: left + width, bottom: top + height, width, height };
 
   const bestScrollable = pickerDidDrag
     ? findBestScrollableFromRect(rect)
-    : findScrollableAncestorFromPoint(e.clientX, e.clientY);
-  const selector = generateSelector(bestScrollable || document.elementFromPoint(e.clientX, e.clientY));
+    : findScrollableAncestorFromPoint(endPoint.x, endPoint.y);
+  const selector = generateSelector(bestScrollable || document.elementFromPoint(endPoint.x, endPoint.y));
 
   if (selector) {
     chrome.runtime.sendMessage({
@@ -707,6 +701,68 @@ function pickerMouseUpHandler(e) {
   }
 
   stopSelectorPicker();
+}
+
+function pickerMouseDownHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll') return;
+  if (typeof e.button === 'number' && e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  pickerDidDrag = false;
+  activePointerId = null;
+  const point = getEventPoint(e);
+  if (!point) return;
+  pickerDragStart = { x: point.x, y: point.y };
+  if (pickerSelectionBox) {
+    pickerSelectionBox.style.display = 'block';
+    pickerSelectionBox.style.left = `${point.x}px`;
+    pickerSelectionBox.style.top = `${point.y}px`;
+    pickerSelectionBox.style.width = '0px';
+    pickerSelectionBox.style.height = '0px';
+  }
+}
+
+function pickerMouseMoveHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart || !pickerSelectionBox) return;
+  const point = getEventPoint(e);
+  if (!point) return;
+  const dx = Math.abs(point.x - pickerDragStart.x);
+  const dy = Math.abs(point.y - pickerDragStart.y);
+  if (dx > 4 || dy > 4) pickerDidDrag = true;
+  const left = Math.min(pickerDragStart.x, point.x);
+  const top = Math.min(pickerDragStart.y, point.y);
+  const width = Math.abs(point.x - pickerDragStart.x);
+  const height = Math.abs(point.y - pickerDragStart.y);
+  pickerSelectionBox.style.left = `${left}px`;
+  pickerSelectionBox.style.top = `${top}px`;
+  pickerSelectionBox.style.width = `${width}px`;
+  pickerSelectionBox.style.height = `${height}px`;
+}
+
+function pickerMouseUpHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart) return;
+  const point = getEventPoint(e);
+  if (!point) return;
+  finalizeScrollPickerByPoint(pickerDragStart, point);
+}
+
+
+function pickerPointerDownHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll') return;
+  if (activePointerId !== null) return;
+  activePointerId = e.pointerId;
+  pickerMouseDownHandler(e);
+}
+
+function pickerPointerMoveHandler(e) {
+  if (activePointerId !== null && e.pointerId !== activePointerId) return;
+  pickerMouseMoveHandler(e);
+}
+
+function pickerPointerUpHandler(e) {
+  if (activePointerId !== null && e.pointerId !== activePointerId) return;
+  activePointerId = null;
+  pickerMouseUpHandler(e);
 }
 
 function pickerHoverHandler(e) {
