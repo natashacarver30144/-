@@ -17,6 +17,11 @@ const extractPhoneFromPath = window.extractPhoneFromPath || (() => null);
 const safeParseJson = window.safeParseJson || (() => null);
 const wait = window.wait || ((ms) => new Promise(r => setTimeout(r, ms)));
 const generateSelector = window.generateSelector || ((el) => el?.tagName?.toLowerCase() || null);
+const sanitizeSettings = window.sanitizeSettings || ((settings) => settings);
+const DEFAULT_SELECTOR_PROFILES = window.DEFAULT_SELECTOR_PROFILES || [];
+
+let activeSelectorProfile = 'manual';
+let selectorConfidence = 0;
 
 let isRunning = false;
 let isPaused = false;
@@ -42,6 +47,9 @@ let stats = {
 let isPickingSelector = false;
 let pickerCallbackType = null;
 let pickerOverlay = null;
+let pickerSelectionBox = null;
+let pickerDragStart = null;
+let pickerDidDrag = false;
 
 // Throttle для логов - не чаще 1 раза в 2 секунды
 let lastLogTime = 0;
@@ -74,7 +82,9 @@ function saveAllData(notifyPopup = false) {
     numbers: Array.from(numberSet),
     duplicateMap,
     duplicateUniqueCount,
-    logs: logBuffer
+    logs: logBuffer,
+    selectorProfileName: activeSelectorProfile,
+    selectorConfidence
   };
   
   chrome.storage.local.set(data, () => {
@@ -105,7 +115,9 @@ function loadState() {
         "duplicateUniqueCount",
         "logs",
         "settings",
-        "settingsJson"
+        "settingsJson",
+        "selectorProfileName",
+        "selectorConfidence"
       ],
       (res) => {
       linkSet = new Set(res.links || []);
@@ -115,11 +127,13 @@ function loadState() {
         res.duplicateUniqueCount || Object.keys(duplicateMap).length;
       logBuffer = res.logs || [];
       const fromJson = res.settingsJson ? safeParseJson(res.settingsJson) : null;
-      currentSettings = {
+      currentSettings = sanitizeSettings({
         ...DEFAULT_SETTINGS,
         ...(res.settings || {}),
         ...(fromJson || {})
-      };
+      });
+      activeSelectorProfile = res.selectorProfileName || 'manual';
+      selectorConfidence = Number(res.selectorConfidence) || 0;
       resolve();
       }
     );
@@ -238,6 +252,151 @@ function collectLinks() {
 
 // Функции normalizeLink, safeParseJson, extractPhoneFromPath, wait уже определены в shared.js
 
+
+function queryAllSafe(selector, root = document) {
+  if (!selector) return [];
+  try {
+    return Array.from(root.querySelectorAll(selector));
+  } catch {
+    return [];
+  }
+}
+
+function queryOneSafe(selector, root = document) {
+  return queryAllSafe(selector, root)[0] || null;
+}
+
+function collectValidLinkCount(selectors, root = document) {
+  if (!Array.isArray(selectors)) return 0;
+  let valid = 0;
+  selectors.forEach((selector) => {
+    const direct = queryAllSafe(selector, root);
+    const generalized = window.generalizeSelector ? window.generalizeSelector(selector) : selector;
+    const nodes = direct.length > 0 ? direct : (generalized !== selector ? queryAllSafe(generalized, root) : []);
+    nodes.forEach((el) => {
+      const href = el.getAttribute('href') || el.href || '';
+      const text = el.textContent?.trim() || '';
+      if (normalizeLink(href) || normalizeLink(text)) valid += 1;
+    });
+  });
+  return valid;
+}
+
+function buildSelectorProfiles(settings) {
+  const primary = {
+    id: 'user-settings',
+    name: 'User settings',
+    scrollSelectors: [settings.scrollSelector].filter(Boolean),
+    linkSelectors: settings.linkSelectors || []
+  };
+  const defaults = (DEFAULT_SELECTOR_PROFILES || []).map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    scrollSelectors: Array.isArray(profile.scrollSelectors) ? profile.scrollSelectors : [],
+    linkSelectors: Array.isArray(profile.linkSelectors) ? profile.linkSelectors : []
+  }));
+  return [primary, ...defaults];
+}
+
+function resolveScrollContainer(scrollSelectors) {
+  for (const selector of (scrollSelectors || [])) {
+    const found = queryOneSafe(selector);
+    if (found) return { container: found, selector, generalized: false };
+    const generalized = window.generalizeSelector ? window.generalizeSelector(selector) : selector;
+    if (generalized && generalized !== selector) {
+      const genFound = queryOneSafe(generalized);
+      if (genFound) return { container: genFound, selector: generalized, generalized: true };
+    }
+  }
+  return { container: null, selector: null, generalized: false };
+}
+
+function evaluateProfile(profile) {
+  const scroll = resolveScrollContainer(profile.scrollSelectors);
+  if (!scroll.container) return { profile, score: 0, confidence: 0, container: null };
+  const validLinks = collectValidLinkCount(profile.linkSelectors, document);
+  const score = validLinks * 5 + (scroll.generalized ? 1 : 3);
+  const confidence = Math.min(100, Math.max(20, validLinks * 8 + (scroll.generalized ? 5 : 15)));
+  return { profile, score, confidence, container: scroll.container, scrollSelector: scroll.selector };
+}
+
+function detectHeuristicProfile() {
+  const candidates = queryAllSafe('div, section, main').filter((el) => {
+    const style = window.getComputedStyle(el);
+    const scrollable = ['auto', 'scroll'].includes(style.overflowY) || el.scrollHeight > el.clientHeight * 1.2;
+    return scrollable && el.clientHeight > 180;
+  }).slice(0, 120);
+
+  let best = null;
+  candidates.forEach((container, idx) => {
+    const linkSelectors = ['a[href*="t.me/"]', 'a[href*="telegram.me/"]', 'a[href^="https://t.me/"]'];
+    const validLinks = collectValidLinkCount(linkSelectors, container);
+    const score = validLinks * 6 + Math.min(10, Math.floor(container.clientHeight / 120));
+    if (!best || score > best.score) {
+      best = {
+        score,
+        validLinks,
+        container,
+        profile: {
+          id: `auto-${idx + 1}`,
+          name: 'Auto-detected',
+          scrollSelectors: [],
+          linkSelectors
+        },
+        confidence: Math.min(95, 35 + validLinks * 10)
+      };
+    }
+  });
+
+  if (!best || best.score < 12) return null;
+  return best;
+}
+
+function chooseWorkingProfile(settings) {
+  const profiles = buildSelectorProfiles(settings);
+  const evaluations = profiles.map(evaluateProfile).sort((a, b) => b.score - a.score);
+  const winner = evaluations[0];
+  if (winner && winner.container && winner.score >= 5) {
+    return winner;
+  }
+
+  // Если контейнер найден, но ссылок пока мало/нет (частый кейс до прогрузки вкладки),
+  // всё равно используем лучший контейнер вместо полного фейла.
+  const containerOnlyWinner = evaluations.find((item) => item?.container);
+  if (containerOnlyWinner) {
+    return {
+      ...containerOnlyWinner,
+      confidence: Math.max(15, Number(containerOnlyWinner.confidence || 0))
+    };
+  }
+
+  const heuristic = detectHeuristicProfile();
+  if (heuristic) {
+    return {
+      profile: heuristic.profile,
+      score: heuristic.score,
+      confidence: heuristic.confidence,
+      container: heuristic.container,
+      scrollSelector: null
+    };
+  }
+  return null;
+}
+
+function applyProfileSelection(selection) {
+  if (!selection) return;
+  const profile = selection.profile || {};
+  if (Array.isArray(profile.linkSelectors) && profile.linkSelectors.length > 0) {
+    currentSettings.linkSelectors = profile.linkSelectors;
+  }
+  if (selection.scrollSelector) {
+    currentSettings.scrollSelector = selection.scrollSelector;
+  }
+  activeSelectorProfile = profile.name || profile.id || 'manual';
+  selectorConfidence = Number(selection.confidence || 0);
+  chrome.storage.local.set({ selectorProfileName: activeSelectorProfile, selectorConfidence });
+}
+
 async function runCollection() {
   if (isRunning) {
     pushLog("Сбор уже запущен", "warn");
@@ -251,37 +410,31 @@ async function runCollection() {
   updateChatTitle();
   pushLog("Старт сбора", "info");
 
-  // Пробуем найти контейнер скролла
-  let container = null;
-  const scrollSel = currentSettings.scrollSelector;
-  
-  // Пробуем прямой селектор
-  try {
-    container = document.querySelector(scrollSel);
-  } catch (e) {}
-  
-  // Если не найден, пробуем обобщённый селектор
-  if (!container && scrollSel) {
-    const generalized = window.generalizeSelector(scrollSel);
-    if (generalized !== scrollSel) {
-      try {
-        container = document.querySelector(generalized);
-        if (container) {
-          pushLog("Использован обобщённый селектор: " + generalized, "info");
-        }
-      } catch (e) {}
-    }
-  }
-      
-  if (!container) {
-    pushLog("Контейнер скролла не найден", "error");
-    isRunning = false;
+  let profileSelection = chooseWorkingProfile(currentSettings);
+  let container = profileSelection?.container || null;
 
-    // Перезагружаем страницу и кликаем на вкладку "Ссылки"
-    chrome.storage.local.set({ shouldClickLinksTab: true }, () => {
-      location.reload();
-    });
-    return;
+  if (profileSelection) {
+    applyProfileSelection(profileSelection);
+    pushLog(`Профиль селекторов: ${activeSelectorProfile} (confidence ${selectorConfidence}%)`, 'info');
+  }
+
+  if (!container) {
+    pushLog('Контейнер не найден, пробуем открыть вкладку "Ссылки" и повторить', 'warn');
+    await clickLinksTab();
+    await wait(900);
+    profileSelection = chooseWorkingProfile(currentSettings);
+    container = profileSelection?.container || null;
+    if (profileSelection) {
+      applyProfileSelection(profileSelection);
+      pushLog(`Профиль селекторов после retry: ${activeSelectorProfile} (confidence ${selectorConfidence}%)`, 'info');
+    }
+
+    if (!container) {
+      pushLog("Контейнер скролла не найден даже после fallback/auto-detect", "error");
+      isRunning = false;
+      flushAllData();
+      return;
+    }
   }
 
   let lastScrollTop = container.scrollTop;
@@ -296,12 +449,13 @@ async function runCollection() {
     if (stopRequested) break;
 
     stats.steps += 1;
-    collectLinks();
+    const before = collectLinks();
 
     container.scrollBy(0, currentSettings.scrollStep);
     await wait(currentSettings.scrollDelay);
 
-    collectLinks();
+    const after = collectLinks();
+    const gained = (before?.newCount || 0) + (after?.newCount || 0);
 
     const heightChanged = container.scrollHeight !== lastHeight;
     const scrollMoved = container.scrollTop !== lastScrollTop;
@@ -316,6 +470,16 @@ async function runCollection() {
         if (heightChanged) changes.push('высота');
         if (scrollMoved) changes.push('скролл');
         pushLog(`Активность: ${changes.join(', ')}`, 'info');
+      }
+    }
+
+    if (!heightChanged && !scrollMoved && gained === 0 && stats.steps > 5 && stats.steps % 8 === 0) {
+      const fallbackSelection = chooseWorkingProfile(currentSettings);
+      if (fallbackSelection?.container) {
+        applyProfileSelection(fallbackSelection);
+        container = fallbackSelection.container;
+        pushLog(`Auto-recover: переключение на профиль ${activeSelectorProfile}`, 'warn');
+        lastActivityTs = Date.now();
       }
     }
 
@@ -377,17 +541,39 @@ function startSelectorPicker(callbackType) {
     height: 100%;
     pointer-events: none;
     z-index: 999999;
-    background: rgba(0, 255, 0, 0.1);
+    background: rgba(0, 255, 0, 0.08);
     display: none;
   `;
   document.body.appendChild(pickerOverlay);
 
-  // Добавляем обработчик hover
-  document.addEventListener('mouseover', pickerHoverHandler, true);
-  document.addEventListener('mouseout', pickerOutHandler, true);
-  document.addEventListener('click', pickerClickHandler, true);
+  pickerSelectionBox = document.createElement('div');
+  pickerSelectionBox.style.cssText = `
+    position: fixed;
+    border: 2px dashed #22c55e;
+    background: rgba(34, 197, 94, 0.15);
+    pointer-events: none;
+    z-index: 1000000;
+    display: none;
+  `;
+  document.body.appendChild(pickerSelectionBox);
 
-  pushLog(`Picker запущен для: ${callbackType}`, "info");
+  // Для scroll selector используем выделение области мышью,
+  // для link selector сохраняем прежний точечный click-picker.
+  if (callbackType === 'scroll') {
+    document.addEventListener('mousedown', pickerMouseDownHandler, true);
+    window.addEventListener('mousemove', pickerMouseMoveHandler, true);
+    window.addEventListener('mouseup', pickerMouseUpHandler, true);
+    if (pickerOverlay) {
+      pickerOverlay.style.display = 'block';
+      pickerOverlay.textContent = 'Выделите область скролла мышкой';
+    }
+    pushLog('Выделите мышкой область скролла (зажмите и отпустите)', 'info');
+  } else {
+    document.addEventListener('mouseover', pickerHoverHandler, true);
+    document.addEventListener('mouseout', pickerOutHandler, true);
+    document.addEventListener('click', pickerClickHandler, true);
+    pushLog(`Picker запущен для: ${callbackType}`, "info");
+  }
 }
 
 function stopSelectorPicker() {
@@ -398,15 +584,129 @@ function stopSelectorPicker() {
     pickerOverlay.remove();
     pickerOverlay = null;
   }
+  if (pickerSelectionBox) {
+    pickerSelectionBox.remove();
+    pickerSelectionBox = null;
+  }
+  pickerDragStart = null;
+  pickerDidDrag = false;
 
   document.removeEventListener('mouseover', pickerHoverHandler, true);
   document.removeEventListener('mouseout', pickerOutHandler, true);
   document.removeEventListener('click', pickerClickHandler, true);
+  document.removeEventListener('mousedown', pickerMouseDownHandler, true);
+  window.removeEventListener('mousemove', pickerMouseMoveHandler, true);
+  window.removeEventListener('mouseup', pickerMouseUpHandler, true);
 
   document.querySelectorAll('[data-picker-highlight]').forEach(el => {
     el.style.outline = '';
     el.removeAttribute('data-picker-highlight');
   });
+}
+
+
+function isScrollableElement(el) {
+  if (!el || !(el instanceof Element)) return false;
+  const style = window.getComputedStyle(el);
+  const overflowY = style.overflowY;
+  const canScroll = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+  return canScroll || el.scrollHeight > el.clientHeight + 20;
+}
+
+function findBestScrollableFromRect(rect) {
+  if (!rect) return null;
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  let node = document.elementFromPoint(cx, cy);
+  while (node) {
+    if (isScrollableElement(node)) return node;
+    node = node.parentElement;
+  }
+
+  const candidates = Array.from(document.querySelectorAll('div, section, main, aside, article'));
+  let best = null;
+  let bestScore = -1;
+  candidates.forEach((el) => {
+    if (!isScrollableElement(el)) return;
+    const r = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.right, r.right) - Math.max(rect.left, r.left));
+    const y = Math.max(0, Math.min(rect.bottom, r.bottom) - Math.max(rect.top, r.top));
+    const overlap = x * y;
+    if (overlap > bestScore) {
+      bestScore = overlap;
+      best = el;
+    }
+  });
+  return best;
+}
+
+
+function findScrollableAncestorFromPoint(x, y) {
+  let node = document.elementFromPoint(x, y);
+  while (node) {
+    if (isScrollableElement(node)) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+function pickerMouseDownHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll') return;
+  if (typeof e.button === 'number' && e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  pickerDidDrag = false;
+  pickerDragStart = { x: e.clientX, y: e.clientY };
+  if (pickerSelectionBox) {
+    pickerSelectionBox.style.display = 'block';
+    pickerSelectionBox.style.left = `${e.clientX}px`;
+    pickerSelectionBox.style.top = `${e.clientY}px`;
+    pickerSelectionBox.style.width = '0px';
+    pickerSelectionBox.style.height = '0px';
+  }
+}
+
+function pickerMouseMoveHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart || !pickerSelectionBox) return;
+  const dx = Math.abs(e.clientX - pickerDragStart.x);
+  const dy = Math.abs(e.clientY - pickerDragStart.y);
+  if (dx > 4 || dy > 4) pickerDidDrag = true;
+  const left = Math.min(pickerDragStart.x, e.clientX);
+  const top = Math.min(pickerDragStart.y, e.clientY);
+  const width = Math.abs(e.clientX - pickerDragStart.x);
+  const height = Math.abs(e.clientY - pickerDragStart.y);
+  pickerSelectionBox.style.left = `${left}px`;
+  pickerSelectionBox.style.top = `${top}px`;
+  pickerSelectionBox.style.width = `${width}px`;
+  pickerSelectionBox.style.height = `${height}px`;
+}
+
+function pickerMouseUpHandler(e) {
+  if (!isPickingSelector || pickerCallbackType !== 'scroll' || !pickerDragStart) return;
+
+  const left = Math.min(pickerDragStart.x, e.clientX);
+  const top = Math.min(pickerDragStart.y, e.clientY);
+  const width = Math.max(4, Math.abs(e.clientX - pickerDragStart.x));
+  const height = Math.max(4, Math.abs(e.clientY - pickerDragStart.y));
+  const rect = { left, top, right: left + width, bottom: top + height, width, height };
+
+  const bestScrollable = pickerDidDrag
+    ? findBestScrollableFromRect(rect)
+    : findScrollableAncestorFromPoint(e.clientX, e.clientY);
+  const selector = generateSelector(bestScrollable || document.elementFromPoint(e.clientX, e.clientY));
+
+  if (selector) {
+    chrome.runtime.sendMessage({
+      type: 'SELECTOR_PICKED',
+      selector,
+      callbackType: pickerCallbackType
+    });
+    pushLog(`Выбран scroll-селектор по области: ${selector}`, 'success');
+  } else {
+    pushLog('Не удалось определить скролл-область', 'error');
+  }
+
+  stopSelectorPicker();
 }
 
 function pickerHoverHandler(e) {
@@ -580,4 +880,3 @@ chrome.runtime.onMessage.addListener((message) => {
     });
   }
 });
-

@@ -532,3 +532,23 @@ textarea {
 .test-result .testing {
   color: var(--accent-blue);
 }
+
+
+.selector-health {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 10px 12px;
+}
+
+.selector-health.good {
+  border-color: var(--accent-green);
+  color: #86efac;
+}
+
+.selector-health.warn {
+  border-color: var(--accent-yellow);
+  color: #fde68a;
+}

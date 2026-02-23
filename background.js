@@ -17,6 +17,34 @@ let lastStateUpdateTime = 0;
 const STATE_UPDATE_THROTTLE_MS = 1000; // Не чаще 1 раза в секунду
 let pendingStateUpdate = null;
 
+
+function sanitizeSettings(rawSettings) {
+  const source = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+  const defaults = DEFAULT_SETTINGS;
+  const normalizeInt = (value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) => {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    const int = Math.trunc(num);
+    if (int < min || int > max) return fallback;
+    return int;
+  };
+
+  const linkSelectors = Array.isArray(source.linkSelectors)
+    ? source.linkSelectors.map((item) => String(item || '').trim()).filter(Boolean)
+    : defaults.linkSelectors;
+
+  return {
+    scrollSelector: String(source.scrollSelector || defaults.scrollSelector || '').trim(),
+    linkSelectors: linkSelectors.length ? linkSelectors : defaults.linkSelectors,
+    scrollStep: normalizeInt(source.scrollStep, defaults.scrollStep, 10, 10000),
+    scrollDelay: normalizeInt(source.scrollDelay, defaults.scrollDelay, 50, 60000),
+    inactivityTimeout: normalizeInt(source.inactivityTimeout, defaults.inactivityTimeout, 1000, 600000),
+    maxSteps: normalizeInt(source.maxSteps, defaults.maxSteps, 0, 100000),
+    retryAttempts: normalizeInt(source.retryAttempts, defaults.retryAttempts, 0, 20),
+    retryDelay: normalizeInt(source.retryDelay, defaults.retryDelay, 0, 30000)
+  };
+}
+
 function safeParseJson(value) {
   try {
     return JSON.parse(value);
@@ -47,14 +75,14 @@ async function initializeStorage() {
     await chrome.storage.local.set({ links: [], numbers: [], duplicates: [], duplicateMap: {}, logs: [] });
   }
   if (!local.settings) {
-    await chrome.storage.local.set({ settings: DEFAULT_SETTINGS });
+    await chrome.storage.local.set({ settings: sanitizeSettings(DEFAULT_SETTINGS) });
   }
   
   // Синхронизация с sync storage
   try {
     const sync = await chrome.storage.sync.get(['settingsBackup']);
     if (sync.settingsBackup && !local.settings) {
-      await chrome.storage.local.set({ settings: sync.settingsBackup });
+      await chrome.storage.local.set({ settings: sanitizeSettings(sync.settingsBackup) });
     }
   } catch (e) {
     console.warn('Sync storage недоступен:', e);
@@ -81,7 +109,7 @@ async function backupSettings(settings) {
     // Ограничение sync storage: 8KB на элемент
     const settingsStr = JSON.stringify(settings);
     if (settingsStr.length < 8000) {
-      await chrome.storage.sync.set({ settingsBackup: settings, lastBackup: Date.now() });
+      await chrome.storage.sync.set({ settingsBackup: sanitizeSettings(settings), lastBackup: Date.now() });
       console.log('Настройки сохранены в облако');
     }
   } catch (e) {
@@ -94,8 +122,9 @@ async function restoreSettings() {
   try {
     const sync = await chrome.storage.sync.get(['settingsBackup']);
     if (sync.settingsBackup) {
-      await chrome.storage.local.set({ settings: sync.settingsBackup });
-      return sync.settingsBackup;
+      const normalized = sanitizeSettings(sync.settingsBackup);
+      await chrome.storage.local.set({ settings: normalized });
+      return normalized;
     }
   } catch (e) {
     console.warn('Не удалось восстановить из sync storage:', e);
@@ -143,7 +172,7 @@ async function handleMessage(message, sender) {
       return { success: true };
 
     case 'BACKUP_SETTINGS':
-      await backupSettings(message.settings);
+      await backupSettings(sanitizeSettings(message.settings));
       return { success: true };
 
     case 'RESTORE_SETTINGS':
@@ -177,7 +206,6 @@ async function handleMessage(message, sender) {
       try {
         await chrome.notifications.create({
           type: 'basic',
-          iconUrl: 'icons/icon128.png',
           title: 'Сбор завершён',
           message: `Собрано ссылок: ${message.count || 0}`
         });
